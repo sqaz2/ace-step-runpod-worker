@@ -19,10 +19,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
     DEMUCS_MODEL=htdemucs \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
+# diffusers 0.42+ (AceStepPipeline) needs Python >= 3.11. Ubuntu 22.04's default is 3.10.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 python3-pip python3-venv \
-        ffmpeg libsndfile1 git ca-certificates wget \
-    && ln -sf /usr/bin/python3 /usr/bin/python \
+        python3.11 python3.11-venv python3.11-dev python3.11-distutils \
+        ffmpeg libsndfile1 git ca-certificates wget curl \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11 \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python \
     && rm -rf /var/lib/apt/lists/*
 
 # PyTorch CUDA wheels first, then the rest. demucs is installed without
