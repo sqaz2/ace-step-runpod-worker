@@ -6,3 +6,7 @@ __pycache__/
 *.wav
 *.log
 .DS_Store
+
+# Baked weights live in the image, not in git.
+models/
+

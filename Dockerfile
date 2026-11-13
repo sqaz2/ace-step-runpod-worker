@@ -19,7 +19,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TORCH_HOME=/models/torch \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
     PIPELINE_PATH=/models/acestep-v15-turbo \
-    DEMUCS_MODEL=htdemucs \
+    DEMUCS_MODEL=htdemucs_ft \
+    UVR_MODEL_DIR=/models/uvr \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     VIRTUAL_ENV=/opt/venv \
     PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -51,15 +52,23 @@ RUN python -m pip install --no-cache-dir -r /tmp/requirements.txt \
 COPY bake_acestep.py /tmp/bake_acestep.py
 RUN python /tmp/bake_acestep.py
 
-# Bake Demucs htdemucs into TORCH_HOME.
+# Bake Demucs htdemucs and htdemucs_ft into TORCH_HOME.
 COPY bake_demucs.py /tmp/bake_demucs.py
 RUN python /tmp/bake_demucs.py
+
+# UVR De-Echo-Aggressive + DeEcho-DeReverb (same models as the site Dereverb tool).
+# Installed after torch so pip cannot replace the CUDA wheel. The two VR-arch
+# models and their hash metadata are baked in so a cold start stays offline.
+RUN printf 'torch==2.11.0\ntorchaudio==2.11.0\n' > /tmp/torch-constraint.txt
+COPY requirements-uvr.txt /tmp/requirements-uvr.txt
+RUN python -m pip install --no-cache-dir --no-deps audio-separator==0.48.0     && python -m pip install --no-cache-dir -r /tmp/requirements-uvr.txt         --constraint /tmp/torch-constraint.txt     && rm -rf /root/.cache/pip
+COPY models/uvr /models/uvr
 
 # After bake, prefer local files. Handler still falls back if a file is missing.
 ENV HF_HUB_OFFLINE=1
 
 WORKDIR /app
-COPY handler.py gate.py check_imports.py /app/
+COPY handler.py gate.py dereverb.py check_imports.py /app/
 
 # Cheap import check (no GPU in the build machine).
 RUN python /app/check_imports.py

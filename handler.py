@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Runpod serverless worker: ACE-Step 1.5 turbo → full mix + gated vocal stem.
+"""Runpod serverless worker: ACE-Step 1.5 turbo → full mix + gated dry vocal.
 
 Proven settings from the Kaggle prototypes:
   Runware/acestep-v15-turbo-diffusers, 16 steps, shift 3.0, float32.
   No CPU offload on a 24 GB GPU. float16 is avoided (NaN on T4; untrusted here).
 
-After generation, Demucs htdemucs (two-stem, shifts=0) pulls a dry vocal,
-which is lightly gated (open -40 dB, close -50 dB, hold 250 ms). Both the
-gated vocal (primary) and the full mix are returned as 192 kb/s mp3.
+After generation, Demucs htdemucs_ft (two-stem, shifts=0) pulls a vocal,
+then UVR-De-Echo-Aggressive and UVR-DeEcho-DeReverb dry it (same models and
+defaults as the site Dereverb tool: window 512, aggression 5), then a light
+gate (open -40 dB, close -50 dB, hold 250 ms). Both the gated vocal (primary)
+and the full mix are returned as 192 kb/s mp3.
 """
 from __future__ import annotations
 
@@ -26,10 +28,11 @@ import numpy as np
 import soundfile as sf
 import torch
 
+from dereverb import dereverb_vocals, get_uvr
 from gate import gate_vocal, rms_db
 
 MODEL_DIR = Path(os.environ.get("PIPELINE_PATH", "/models/acestep-v15-turbo"))
-DEMUCS_NAME = os.environ.get("DEMUCS_MODEL", "htdemucs")
+DEMUCS_NAME = os.environ.get("DEMUCS_MODEL", "htdemucs_ft")
 STEPS = 16
 SHIFT = 3.0
 MIN_DURATION = 10.0
@@ -365,15 +368,17 @@ def separate_vocals(mix: np.ndarray, sr: int) -> tuple[np.ndarray, int, float]:
                 shifts=0,
             )[0]
         vocals = sources[list(model.sources).index("vocals")]
-        vocals = convert_audio(vocals.cpu(), model.samplerate, sr, vocals.shape[0])
-        out = vocals.numpy().T  # [T, C]
+        # Keep the native Demucs rate (44.1 kHz). UVR runs at 44.1, then we
+        # resample to the mix rate, matching the 03_normal_vocals_cleaner take.
+        out = vocals.cpu().numpy().T  # [T, C]
+        out_sr = int(model.samplerate)
     finally:
         # Free VRAM so a warm ACE-Step request isn't squeezed.
         model.to("cpu")
         cuda_free()
     elapsed = time.time() - t0
-    log(f"demucs vocals in {elapsed:.1f}s shape={out.shape} rms_db={rms_db(out):.1f}")
-    return out, sr, elapsed
+    log(f"demucs {DEMUCS_NAME} vocals in {elapsed:.1f}s shape={out.shape} sr={out_sr} rms_db={rms_db(out):.1f}")
+    return out, out_sr, elapsed
 
 
 def parse_input(event: dict) -> dict[str, Any]:
@@ -447,14 +452,20 @@ def handler(event: dict) -> dict[str, Any]:
     cuda_free()
 
     vocals, voc_sr, sep_s = separate_vocals(mix, sr)
-    gated, gate_report = gate_vocal(vocals, voc_sr)
+    dry, dry_sr, uvr_s = dereverb_vocals(vocals, voc_sr)
+    if dry_sr != sr:
+        import torchaudio
+        t_dry = torch.from_numpy(np.ascontiguousarray(dry.T, dtype=np.float32))
+        dry = torchaudio.functional.resample(t_dry, dry_sr, sr).numpy().T.astype(np.float32)
+        dry_sr = sr
+    gated, gate_report = gate_vocal(dry, dry_sr)
     log(f"gate: {json.dumps({k: gate_report[k] for k in gate_report if k != 'regions_sec'})}")
 
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         vocals_mp3 = td / "vocals.mp3"
         mix_mp3 = td / "mix.mp3"
-        encode_mp3(gated, voc_sr, vocals_mp3)
+        encode_mp3(gated, dry_sr, vocals_mp3)
         encode_mp3(mix, sr, mix_mp3)
         vocals_b64 = b64_file(vocals_mp3)
         mix_b64 = b64_file(mix_mp3)
@@ -462,7 +473,7 @@ def handler(event: dict) -> dict[str, Any]:
         mix_bytes = mix_mp3.stat().st_size
 
     total = time.time() - t_all
-    log(f"done in {total:.1f}s infer={infer_s:.1f}s sep={sep_s:.1f}s voc={vocals_bytes} mix={mix_bytes}")
+    log(f"done in {total:.1f}s infer={infer_s:.1f}s sep={sep_s:.1f}s uvr={uvr_s:.1f}s voc={vocals_bytes} mix={mix_bytes}")
     return {
         "ok": True,
         "vocals_mp3_base64": vocals_b64,
@@ -480,12 +491,14 @@ def handler(event: dict) -> dict[str, Any]:
         "lyrics": job["lyrics"],
         "infer_seconds": round(infer_s, 2),
         "separate_seconds": round(sep_s, 2),
+        "uvr_seconds": round(uvr_s, 2),
         "total_seconds": round(total, 2),
         "decode_path": decode_path,
         "dtype": "float32",
         "device": device_name,
         "model": "Runware/acestep-v15-turbo-diffusers",
         "separator": DEMUCS_NAME,
+        "dereverb": "UVR-De-Echo-Aggressive+UVR-DeEcho-DeReverb",
         "gate": gate_report,
         "mix_quality": mix_q,
         "primary": "vocals",
@@ -501,6 +514,7 @@ def preload() -> None:
         log("WARNING: no CUDA at startup")
     get_pipe()
     get_demucs()
+    get_uvr()
     log("preload complete")
 
 

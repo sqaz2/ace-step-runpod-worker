@@ -2,7 +2,7 @@
 
 Serverless worker used by [generative.download](https://generative.download) `/create`.
 It writes a song from Suno-style tags and lyrics with **ACE-Step 1.5** (2B turbo),
-then splits out a dry vocal with **Demucs htdemucs** and applies a light gate.
+then splits out a vocal with **Demucs htdemucs_ft**, dries it with **UVR De-Echo-Aggressive** then **UVR-DeEcho-DeReverb** (same models as the site Dereverb tool), and applies a light gate.
 The job returns **both** files: the gated vocal (primary) and the full mix.
 
 The image is public and contains no secrets. Model weights are baked in so a
@@ -16,7 +16,8 @@ cold start does not download them.
 | Steps / shift | 16 / 3.0 |
 | Dtype | float32 (float16 produced NaNs on a T4; not used) |
 | Offload | none, on a 24 GB GPU |
-| Separator | Demucs `htdemucs`, two-stem, `shifts=0`, overlap 0.25 |
+| Separator | Demucs `htdemucs_ft`, two-stem, `shifts=0`, overlap 0.25 |
+| Dereverb | UVR-De-Echo-Aggressive then UVR-DeEcho-DeReverb (window 512, aggression 5), on the GPU |
 | Gate | open −40 dB, close −50 dB, hold 250 ms, pre 30 ms, 20 ms fades |
 | Duration | 10–240 seconds |
 | Output | 192 kb/s mp3, vocals + full mix |

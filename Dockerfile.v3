@@ -1,0 +1,38 @@
+# Thin v3 layer on top of the working v2 image (Ubuntu 24.04, torch 2.11+cu126).
+# Adds htdemucs_ft weights, UVR De-Echo-Aggressive + DeEcho-DeReverb, and
+# the handler chain: separate → UVR → gate.
+# Do not use :local as the base (it predates the split= fix).
+FROM ghcr.io/sqaz2/ace-step-runpod-worker:v2
+
+ENV DEMUCS_MODEL=htdemucs_ft \
+    UVR_MODEL_DIR=/models/uvr
+
+# Pin torch so pip cannot replace the CUDA 12.6 wheel.
+RUN printf 'torch==2.11.0\ntorchaudio==2.11.0\n' > /tmp/torch-constraint.txt
+
+COPY requirements-uvr.txt /tmp/requirements-uvr.txt
+# --no-deps on audio-separator skips diffq (needs gcc, unused for VR models).
+# separator.py still imports onnxruntime at module load; the CPU wheel is
+# enough because our two models are PyTorch .pth files that run on CUDA
+# through torch. HF_HUB_OFFLINE=1 is inherited from v2.
+RUN python -m pip install --no-cache-dir --no-deps audio-separator==0.48.0 \
+    && python -m pip install --no-cache-dir -r /tmp/requirements-uvr.txt \
+        --constraint /tmp/torch-constraint.txt \
+    && python -c "from audio_separator.separator import Separator; print('audio-separator import ok')" \
+    && rm -rf /root/.cache/pip /tmp/torch-constraint.txt /tmp/requirements-uvr.txt
+
+# Baked UVR models + the hash metadata audio-separator looks up offline.
+COPY models/uvr/ /models/uvr/
+
+# htdemucs_ft bag (4 checkpoints). torch.hub finds them under TORCH_HOME.
+COPY models/torch/hub/checkpoints/ /models/torch/hub/checkpoints/
+
+WORKDIR /app
+COPY handler.py gate.py dereverb.py check_imports.py bake_demucs.py /app/
+
+# Confirm ft loads from the baked files with no network, and UVR files are present.
+# HF_HUB_OFFLINE stays 1; torch.hub still reads local checkpoints.
+RUN python /app/check_imports.py \
+    && python -c "from demucs.pretrained import get_model; m=get_model('htdemucs_ft'); print('htdemucs_ft', type(m).__name__, 'n=', len(getattr(m,'models',[m])), 'sr', m.samplerate)"
+
+CMD ["python", "-u", "/app/handler.py"]
