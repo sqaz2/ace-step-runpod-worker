@@ -6,7 +6,10 @@
 #
 # Runtime: 24 GB GPU (AMPERE_24: L4 / A5000 / 3090). float32, no CPU offload.
 
-FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+# Ubuntu 24.04 ships Python 3.12. We need >= 3.11.0 final (diffusers 0.42
+# and transformers 5.23 both declare Requires-Python >= 3.11.0; Ubuntu
+# 22.04's python3.11 package is 3.11.0rc1, which PEP 440 treats as older).
+FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -17,24 +20,27 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
     PIPELINE_PATH=/models/acestep-v15-turbo \
     DEMUCS_MODEL=htdemucs \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# diffusers 0.42+ (AceStepPipeline) needs Python >= 3.11. Ubuntu 22.04's default is 3.10.
+# python3-venv avoids Ubuntu 24.04's PEP 668 "externally managed" pip block.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3.11 python3.11-venv python3.11-dev python3.11-distutils \
+        python3 python3-venv python3-dev \
         ffmpeg libsndfile1 git ca-certificates wget curl \
-    && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11 \
-    && ln -sf /usr/bin/python3.11 /usr/local/bin/python \
-    && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
-    && ln -sf /usr/bin/python3.11 /usr/bin/python \
+    && python3 -m venv /opt/venv \
+    && ln -sf /opt/venv/bin/python /usr/local/bin/python \
+    && ln -sf /opt/venv/bin/python /usr/local/bin/python3 \
     && rm -rf /var/lib/apt/lists/*
 
 # PyTorch CUDA wheels first, then the rest. demucs is installed without
 # its own torch pin so we keep the CUDA build.
+# diffusers 0.42 uses torch.accelerator (PyTorch >= 2.7). 2.11+cu126
+# matches the proven Kaggle ACE-Step run (2.11) on this 12.6 runtime.
 RUN python -m pip install --no-cache-dir --upgrade pip \
     && python -m pip install --no-cache-dir \
-        torch==2.5.1 torchaudio==2.5.1 \
-        --index-url https://download.pytorch.org/whl/cu124
+        torch==2.11.0 torchaudio==2.11.0 \
+        --index-url https://download.pytorch.org/whl/cu126
 
 COPY requirements.txt /tmp/requirements.txt
 RUN python -m pip install --no-cache-dir -r /tmp/requirements.txt \
@@ -42,33 +48,20 @@ RUN python -m pip install --no-cache-dir -r /tmp/requirements.txt \
     && rm -rf /root/.cache/pip
 
 # Bake ACE-Step 1.5 2B turbo (~6.3 GB) at a pinned revision.
-RUN python -c "\
-from huggingface_hub import snapshot_download; \
-snapshot_download( \
-    'Runware/acestep-v15-turbo-diffusers', \
-    revision='be23effe449c5957947f3020fd63bee23c64abe4', \
-    local_dir='/models/acestep-v15-turbo', \
-    local_dir_use_symlinks=False); \
-print('ACE-Step weights ready')"
+COPY bake_acestep.py /tmp/bake_acestep.py
+RUN python /tmp/bake_acestep.py
 
 # Bake Demucs htdemucs into TORCH_HOME.
-RUN python -c "\
-from demucs.pretrained import get_model; \
-m = get_model('htdemucs'); \
-print('demucs', type(m).__name__, 'sources', getattr(m, 'sources', None), 'sr', getattr(m, 'samplerate', None))"
+COPY bake_demucs.py /tmp/bake_demucs.py
+RUN python /tmp/bake_demucs.py
 
 # After bake, prefer local files. Handler still falls back if a file is missing.
 ENV HF_HUB_OFFLINE=1
 
 WORKDIR /app
-COPY handler.py gate.py /app/
+COPY handler.py gate.py check_imports.py /app/
 
 # Cheap import check (no GPU in the build machine).
-RUN python -c "\
-import gate, inspect, torch, diffusers; \
-from diffusers import AceStepPipeline; \
-print('torch', torch.__version__, 'cuda_built', torch.version.cuda); \
-print('diffusers', diffusers.__version__, 'AceStepPipeline ok'); \
-print('gate open_db', gate.OPEN_DB)"
+RUN python /app/check_imports.py
 
 CMD ["python", "-u", "/app/handler.py"]

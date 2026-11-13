@@ -1,9 +1,11 @@
 # Torch is installed from the CUDA index in the Dockerfile.
+# diffusers 0.42 needs huggingface-hub >=1.32; transformers 4.x wants <1.0,
+# so this image uses transformers 5.x, which accepts hub 1.32–2.x.
 diffusers==0.42.0
-transformers>=4.44.0,<4.52
+transformers>=5.23.0,<6
 accelerate>=1.0.0
-safetensors>=0.4.5
-huggingface_hub>=0.26.0
+safetensors>=0.8.0
+huggingface_hub>=1.32.0,<3.0
 hf_transfer>=0.1.8
 soundfile>=0.12.1
 runpod>=1.7.0
@@ -15,3 +17,7 @@ lameenc>=1.7.0
 openunmix>=1.2.1
 pyyaml>=6.0
 tqdm>=4.66.0
+sentencepiece>=0.1.99
+# demucs 4.0.1 --no-deps still imports these at runtime.
+dora-search>=0.1.12
+treetable>=0.2.3
