@@ -1,0 +1,12 @@
+.git
+.github
+.gitignore
+README.md
+*.md
+__pycache__
+*.pyc
+.venv
+.env
+*.mp3
+*.wav
+*.log
