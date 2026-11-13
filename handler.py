@@ -360,7 +360,7 @@ def separate_vocals(mix: np.ndarray, sr: int) -> tuple[np.ndarray, int, float]:
                 model,
                 wav_t[None].to(device),
                 device=device,
-                splits=True,
+                split=True,
                 overlap=0.25,
                 shifts=0,
             )[0]
