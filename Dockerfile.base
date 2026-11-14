@@ -38,7 +38,7 @@ RUN python /tmp/bake_acestep_base.py && rm -rf /models/acestep-v15-base/.cache
 ENV HF_HUB_OFFLINE=1
 
 WORKDIR /app
-COPY handler.py gate.py dereverb.py check_imports.py /app/
+COPY handler.py gate.py dereverb.py layers.py check_imports.py /app/
 RUN python /app/check_imports.py \
     && python -c "from demucs.pretrained import get_model; m=get_model('htdemucs_ft'); print('htdemucs_ft ok', m.samplerate)"
 

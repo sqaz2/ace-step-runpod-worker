@@ -30,6 +30,7 @@ import torch
 
 from dereverb import dereverb_vocals, get_uvr
 from gate import gate_vocal, rms_db
+import layers as vlayers
 
 MODEL_DIR = Path(os.environ.get("PIPELINE_PATH", "/models/acestep-v15-turbo"))
 DEMUCS_NAME = os.environ.get("DEMUCS_MODEL", "htdemucs_ft")
@@ -117,12 +118,12 @@ def peak_limit(arr: np.ndarray, ceiling: float = 0.98) -> np.ndarray:
     return arr
 
 
-def encode_mp3(wav: np.ndarray, sr: int, path: Path) -> None:
+def encode_mp3(wav: np.ndarray, sr: int, path: Path, bitrate: str = MP3_BITRATE) -> None:
     wav = peak_limit(np.asarray(wav, dtype=np.float32))
     wav_path = path.with_suffix(".wav")
     sf.write(str(wav_path), wav, sr, subtype="PCM_16")
     subprocess.run(
-        ["ffmpeg", "-y", "-i", str(wav_path), "-codec:a", "libmp3lame", "-b:a", MP3_BITRATE, str(path)],
+        ["ffmpeg", "-y", "-i", str(wav_path), "-codec:a", "libmp3lame", "-b:a", bitrate, str(path)],
         check=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -521,11 +522,11 @@ VOCAL_REL_DB = float(os.environ.get("BEAT_VOCAL_REL_DB", "-20"))
 VOCAL_ACTIVE_FRACTION = float(os.environ.get("BEAT_VOCAL_ACTIVE_FRACTION", "0.15"))
 
 
-def detect_and_strip_vocal(beat: np.ndarray, sr: int, mode: str) -> tuple[np.ndarray, dict[str, Any], np.ndarray | None]:
-    """Return (context_audio, report, instrumental_or_None). Never edits `beat`."""
+def detect_and_strip_vocal(beat: np.ndarray, sr: int, mode: str) -> tuple[np.ndarray, dict[str, Any], np.ndarray | None, np.ndarray | None]:
+    """Return (context_audio, report, instrumental_or_None, old_vocal_or_None). Never edits `beat`."""
     report: dict[str, Any] = {"mode": mode, "detected": False, "removed": False}
     if mode == "keep":
-        return beat, report, None
+        return beat, report, None, None
     vocals, voc_sr, sep_s = separate_vocals(beat, sr)
     if voc_sr != sr:
         import torchaudio
@@ -546,8 +547,8 @@ def detect_and_strip_vocal(beat: np.ndarray, sr: int, mode: str) -> tuple[np.nda
     if mode == "remove" or detected:
         instrumental = (beat - vocals).astype(np.float32)
         report["removed"] = True
-        return instrumental, report, instrumental
-    return beat, report, None
+        return instrumental, report, instrumental, vocals
+    return beat, report, None, None
 
 
 def parse_input(event: dict) -> dict[str, Any]:
@@ -593,7 +594,20 @@ def parse_input(event: dict) -> dict[str, Any]:
         bpm = beat["bpm"]
     if beat is not None and lyrics == "[Instrumental]":
         raise ValueError("Add some lyrics so there is something to sing.")
+    raw_layers = inp.get("layers") or []
+    if not isinstance(raw_layers, list) or any(l not in ("double", "harmony", "adlibs") for l in raw_layers):
+        raise ValueError("layers can include double, harmony, and adlibs.")
+    harmony_interval = "fifth" if inp.get("harmony_interval") == "fifth" else "third"
+    timesig = str(inp.get("timesignature") or "4").strip()
+    if timesig not in ("2", "3", "4", "6"):
+        timesig = "4"
+    keyscale = inp.get("keyscale")
+    keyscale = keyscale.strip()[:16] if isinstance(keyscale, str) and keyscale.strip() else None
     return {
+        "layers": sorted(set(raw_layers)) if beat is not None else [],
+        "harmony_interval": harmony_interval,
+        "timesignature": timesig,
+        "keyscale": keyscale,
         "beat": beat,
         "return_raw": bool(inp.get("return_raw")),
         "tags": tags,
@@ -698,45 +712,70 @@ def handle_beat(pipe, job: dict[str, Any], t_all: float, device_name: str) -> di
     beat_secs = frames / float(sr)
     log(f"beat: {beat_secs:.2f}s at {sr} Hz, decoded in {time.time()-t_dec:.1f}s rms_db={rms_db(beat):.1f}")
     # If the clip already has a singer, swap it: Lego writes over the instrumental.
-    context, vocal_report, instrumental = detect_and_strip_vocal(beat, sr, job["beat"].get("vocals", "auto"))
+    context, vocal_report, instrumental, old_vocal = detect_and_strip_vocal(beat, sr, job["beat"].get("vocals", "auto"))
+    key = vlayers.estimate_key(context, sr)
+    keyscale = job["keyscale"] or (key["name"] if key["confidence"] >= 0.75 else None)
+    log(f"key estimate {key} -> keyscale={keyscale}")
     src = torch.from_numpy(np.ascontiguousarray(context.T, dtype=np.float32))  # [2, T]
 
-    stem, stem_sr, infer_s, decode_path, stem_q = generate_mix(
-        pipe,
-        job["tags"],
-        job["lyrics"],
-        beat_secs,
-        job["bpm"],
-        job["seed"],
-        job["vocal_language"],
-        extra={
-            "task_type": "lego",
-            "track_name": "vocals",
-            "src_audio": src,
-            "repainting_start": 0.0,
-            "repainting_end": -1,
-        },
-    )
-    del src
+    def lego(track: str, tags: str, lyrics: str, seed: int):
+        extra = {"task_type": "lego", "track_name": track, "src_audio": src, "repainting_start": 0.0,
+                 "repainting_end": -1, "timesignature": job["timesignature"]}
+        if keyscale:
+            extra["keyscale"] = keyscale
+        return generate_mix(pipe, tags, lyrics, beat_secs, job["bpm"], seed, job["vocal_language"], extra=extra)
+
+    def dry(stem: np.ndarray) -> tuple[np.ndarray, dict[str, Any], float, float]:
+        vocals, voc_sr, sep = separate_vocals(stem, sr)
+        d, d_sr, uvr = dereverb_vocals(vocals, voc_sr)
+        if d_sr != sr:
+            import torchaudio
+            t_dry = torch.from_numpy(np.ascontiguousarray(d.T, dtype=np.float32))
+            d = torchaudio.functional.resample(t_dry, d_sr, sr).numpy().T.astype(np.float32)
+        g, rep = gate_vocal(d, sr)
+        return fit_length(g, frames), rep, sep, uvr
+
+    stem, stem_sr, infer_s, decode_path, stem_q = lego("vocals", job["tags"], job["lyrics"], job["seed"])
     cuda_free()
     if stem_sr != sr:
         raise RuntimeError(f"unexpected sample rate {stem_sr}")
     stem = fit_length(stem, frames)
-
     # Same dry chain as /create, even though Lego already returns a vocal stem.
-    vocals, voc_sr, sep_s = separate_vocals(stem, sr)
-    dry, dry_sr, uvr_s = dereverb_vocals(vocals, voc_sr)
-    if dry_sr != sr:
-        import torchaudio
-        t_dry = torch.from_numpy(np.ascontiguousarray(dry.T, dtype=np.float32))
-        dry = torchaudio.functional.resample(t_dry, dry_sr, sr).numpy().T.astype(np.float32)
-        dry_sr = sr
-    gated, gate_report = gate_vocal(dry, dry_sr)
-    gated = fit_length(gated, frames)
+    gated, gate_report, sep_s, uvr_s = dry(stem)
     log(f"gate: {json.dumps({k: gate_report[k] for k in gate_report if k != 'regions_sec'})}")
 
-    # Preview only: the beat (instrumental when the old vocal was swapped) plus the dry vocal.
-    preview = context + gated
+    # Level: match the vocal we swapped out, or sit a little under the beat.
+    target_db = vlayers.active_rms_db(old_vocal, sr) if old_vocal is not None else vlayers.active_rms_db(context, sr) - 2.0
+    if target_db < -60:
+        target_db = vlayers.active_rms_db(context, sr) - 2.0
+    gated, lead_gain = vlayers.level_match(gated, sr, target_db)
+    gated = vlayers.edge_fades(gated, sr)
+
+    layer_audio: dict[str, np.ndarray] = {}
+    layer_report: dict[str, Any] = {}
+    t_layers = time.time()
+    if "double" in job["layers"]:
+        layer_audio["double"] = vlayers.edge_fades(vlayers.make_double(gated, sr, job["seed"]), sr)
+        layer_report["double"] = {"method": "detuned, time-varied copy of the lead (+9 cents, 18-32 ms)"}
+    if "harmony" in job["layers"]:
+        harm, rep = vlayers.make_harmony(gated, sr, key, job["harmony_interval"])
+        layer_audio["harmony"] = vlayers.edge_fades(harm, sr)
+        layer_report["harmony"] = rep
+    if "adlibs" in job["layers"]:
+        a_stem, _, a_infer, _, _ = lego("backing_vocals", "ad-libs, hype background vocal shouts, sparse, short phrases, dry vocal",
+                                        vlayers.adlib_lyrics(job["lyrics"], beat_secs), job["seed"] + 101)
+        cuda_free()
+        a_gated, a_rep, _, _ = dry(fit_length(a_stem, frames))
+        a_gated = a_gated * vlayers.gaps_mask(gated, sr)[:, None]
+        a_gated, a_gain = vlayers.level_match(a_gated, sr, target_db - 5.0)
+        layer_audio["adlibs"] = vlayers.edge_fades(a_gated, sr)
+        layer_report["adlibs"] = {"method": "second Lego take (backing_vocals) gated to the gaps in the lead",
+                                  "infer_seconds": round(a_infer, 2), "open_fraction_before_gaps": a_rep.get("open_fraction"),
+                                  "rms_db": round(vlayers.active_rms_db(layer_audio["adlibs"], sr), 1)}
+    layers_s = time.time() - t_layers
+
+    # Preview only: the beat (instrumental when the old vocal was swapped) plus the dry vocal(s).
+    preview = context + gated + sum((v for v in layer_audio.values()), np.zeros_like(gated))
 
     out: dict[str, Any] = {}
     with tempfile.TemporaryDirectory() as td:
@@ -749,6 +788,10 @@ def handle_beat(pipe, job: dict[str, Any], t_all: float, device_name: str) -> di
         out["preview_mp3_base64"] = b64_file(preview_mp3)
         out["vocals_bytes"] = vocals_mp3.stat().st_size
         out["preview_bytes"] = preview_mp3.stat().st_size
+        for name, audio in layer_audio.items():
+            path = td / f"{name}.mp3"
+            encode_mp3(audio, sr, path, bitrate="128k")
+            out[f"{name}_mp3_base64"] = b64_file(path)
         if instrumental is not None:
             inst_mp3 = td / "instrumental.mp3"
             encode_mp3(instrumental, sr, inst_mp3)
@@ -790,6 +833,13 @@ def handle_beat(pipe, job: dict[str, Any], t_all: float, device_name: str) -> di
         "stem_quality": stem_q,
         "voiceSwapApplied": False,
         "beat_vocal": vocal_report,
+        "key": key,
+        "keyscale_sent": keyscale,
+        "timesignature": job["timesignature"],
+        "lead_gain_db": lead_gain,
+        "lead_target_db": round(float(target_db), 1),
+        "layers": layer_report,
+        "layers_seconds": round(layers_s, 2),
         "primary": "vocals",
     })
     return out
