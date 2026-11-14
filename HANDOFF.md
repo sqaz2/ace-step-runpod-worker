@@ -1,7 +1,38 @@
 # Handoff: Generative audio track (bring-your-own-beat vocals)
 
 Written Fri 13 Nov 2026, 11:35 PM America/Edmonton, for whoever picks this up next (e.g. ChatGPT).
-Owner: Will Crowell (GitHub sqaz2). Nothing here is merged or live.
+Owner: Will Crowell (GitHub sqaz2). See the production release checkpoint below.
+
+## Production release (14 November 2026)
+
+Will authorized building and publishing the feature. Both PRs are merged:
+worker merge `7d8fa6b1251bb8fe5de4c689547990b37006be82`, site merge
+`f5a38ec9cbdc77d6b36f42341dec2b5b030576e6`.
+
+- Production image `ghcr.io/sqaz2/ace-step-runpod-worker:base-v4` is publicly
+  downloadable. Digest: `sha256:f7a1e1d3fd7580e7e29b5b89901ee3a07e20b039abd575ae3e878f99da31b569`.
+  Immutable tag: `base-v4-22c0e39250d97f5e2954d3b193c0fa816d18128d`.
+  All 12 CPU regression tests passed inside this image before publication.
+- Owner reports deploying the new image through the existing BYOB endpoint's
+  Manage -> New release screen. This workspace's network policy blocked the
+  RunPod API; the endpoint release and a live GPU job are not independently verified.
+- The image uses CUDA 12.6. The owner's GPU settings screenshot warned that
+  latest-generation GPUs need CUDA 12.8+. Use previous-generation 24 GB GPUs
+  for the live test, and keep min 0 / max 1.
+- Cloudflare production build `c7391c56-c8a3-49ef-aabf-887aaedb58ee` succeeded
+  and deployed Worker version `7b746b88-4f5e-4868-8176-a4ce40cfa7cf`.
+  The live /release.json reports site merge `f5a38ec9cbdc77d6b36f42341dec2b5b030576e6`
+  with dirty=false. Local typecheck and 3,934 tests passed (one test skipped);
+  the complete Cloudflare production build also passed.
+- Browser verification: https://generative.download/mix loads, New track
+  offers Generative audio, and /api/create/vocals-over-beat/status returns
+  available=true with 10-120 second limits. This proves UI rollout and backend
+  configuration, not successful GPU inference.
+- Next: owner runs one bounded live generation using a 10-40 second selection.
+  Compare the result against preferred version C and inspect any worker error.
+  The existing /create endpoint was not changed.
+
+The earlier checkpoints below describe the work before this release.
 
 ## Listening decision (14 November 2026)
 
