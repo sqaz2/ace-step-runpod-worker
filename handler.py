@@ -33,10 +33,22 @@ from gate import gate_vocal, rms_db
 
 MODEL_DIR = Path(os.environ.get("PIPELINE_PATH", "/models/acestep-v15-turbo"))
 DEMUCS_NAME = os.environ.get("DEMUCS_MODEL", "htdemucs_ft")
-STEPS = 16
+# "turbo" (default, /create) or "base" (bring-your-own-beat, Lego vocals).
+VARIANT = os.environ.get("ACESTEP_VARIANT", "turbo").strip().lower()
+IS_BASE = VARIANT == "base"
+MODEL_ID = os.environ.get(
+    "ACESTEP_MODEL_ID",
+    "Runware/acestep-v15-base-diffusers" if IS_BASE else "Runware/acestep-v15-turbo-diffusers",
+)
+STEPS = int(os.environ.get("ACESTEP_STEPS", "50" if IS_BASE else "16"))
+GUIDANCE = float(os.environ.get("ACESTEP_GUIDANCE", "7.0" if IS_BASE else "1.0"))
 SHIFT = 3.0
 MIN_DURATION = 10.0
 MAX_DURATION = 240.0
+# Bring-your-own-beat limits.
+BEAT_MAX_SECONDS = 120.0
+BEAT_MAX_BYTES = 24 * 1024 * 1024
+BEAT_URL_TIMEOUT = 30
 MP3_BITRATE = "192k"
 
 PIPE = None
@@ -232,7 +244,7 @@ def decode_tiled(pipe, xt, chunk_sec: float = 20.0, overlap_sec: float = 2.0):
 def load_pipe():
     from diffusers import AceStepPipeline
 
-    src = str(MODEL_DIR) if MODEL_DIR.exists() else "Runware/acestep-v15-turbo-diffusers"
+    src = str(MODEL_DIR) if MODEL_DIR.exists() else MODEL_ID
     log(f"loading AceStepPipeline from {src} float32, no offload")
     t0 = time.time()
     try:
@@ -272,8 +284,17 @@ def get_demucs():
     return DEMUCS, DEMUCS_DEVICE
 
 
-def generate_mix(pipe, tags: str, lyrics: str, duration: float, bpm: float | None, seed: int, language: str):
-    log(f"DiT generate duration={duration}s steps={STEPS} shift={SHIFT} bpm={bpm} seed={seed}")
+def generate_mix(
+    pipe,
+    tags: str,
+    lyrics: str,
+    duration: float,
+    bpm: float | None,
+    seed: int,
+    language: str,
+    extra: dict[str, Any] | None = None,
+):
+    log(f"DiT generate duration={duration}s steps={STEPS} cfg={GUIDANCE} shift={SHIFT} bpm={bpm} seed={seed} task={(extra or {}).get('task_type', 'text2music')}")
     t0 = time.time()
     gen = torch.Generator(device="cpu").manual_seed(int(seed))
     kwargs = dict(
@@ -287,8 +308,12 @@ def generate_mix(pipe, tags: str, lyrics: str, duration: float, bpm: float | Non
         generator=gen,
         callback_on_step_end=nan_watch,
     )
+    if IS_BASE:
+        kwargs["guidance_scale"] = GUIDANCE
     if bpm is not None:
         kwargs["bpm"] = float(bpm)
+    if extra:
+        kwargs.update(extra)
 
     # Prefer a direct audio decode on 24 GB; fall back to latent + tiled VAE.
     audio = None
@@ -381,6 +406,150 @@ def separate_vocals(mix: np.ndarray, sr: int) -> tuple[np.ndarray, int, float]:
     return out, out_sr, elapsed
 
 
+def _decode_beat_bytes(data: bytes, start: float, end: float | None, sr: int) -> np.ndarray:
+    """Decode any ffmpeg-readable audio, clip [start, end), return [T, 2] float32 at sr."""
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "beat.bin"
+        src.write_bytes(data)
+        cmd = ["ffmpeg", "-nostdin", "-v", "error", "-y"]
+        if start > 0:
+            cmd += ["-ss", f"{start:.3f}"]
+        cmd += ["-i", str(src)]
+        if end is not None:
+            cmd += ["-t", f"{max(0.0, end - start):.3f}"]
+        cmd += ["-map", "0:a:0", "-ac", "2", "-ar", str(sr), "-f", "f32le", "-acodec", "pcm_f32le", "pipe:1"]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        if proc.returncode != 0:
+            raise ValueError("Could not read the beat audio. Try a WAV or MP3.")
+        pcm = np.frombuffer(proc.stdout, dtype=np.float32)
+    if pcm.size < 2:
+        raise ValueError("The beat clip is empty.")
+    pcm = pcm[: pcm.size - (pcm.size % 2)].reshape(-1, 2).copy()
+    if not np.all(np.isfinite(pcm)):
+        pcm = np.nan_to_num(pcm)
+    return pcm
+
+
+def _fetch_beat_url(url: str) -> bytes:
+    import urllib.request
+
+    if not isinstance(url, str) or not url.startswith("https://"):
+        raise ValueError("The beat URL must start with https://")
+    req = urllib.request.Request(url, headers={"User-Agent": "ace-step-runpod-worker"})
+    with urllib.request.urlopen(req, timeout=BEAT_URL_TIMEOUT) as resp:
+        ctype = (resp.headers.get("content-type") or "").lower()
+        if ctype and not (ctype.startswith("audio/") or ctype.startswith("video/") or "octet-stream" in ctype):
+            raise ValueError("The beat URL is not an audio file.")
+        data = resp.read(BEAT_MAX_BYTES + 1)
+    if len(data) > BEAT_MAX_BYTES:
+        raise ValueError("The beat file is too big.")
+    return data
+
+
+def parse_beat(raw: Any) -> dict[str, Any] | None:
+    """Validate the optional bring-your-own-beat block. Returns None when absent."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("beat must be an object.")
+    b64 = raw.get("audio_base64") or raw.get("mp3_base64") or raw.get("wav_base64")
+    url = raw.get("url")
+    if bool(b64) == bool(url):
+        raise ValueError("Send the beat as exactly one of audio_base64 or url.")
+    if url is not None and (not isinstance(url, str) or not url.startswith("https://") or len(url) > 2048):
+        raise ValueError("The beat URL must start with https://")
+    if b64 is not None and not isinstance(b64, str):
+        raise ValueError("beat audio_base64 must be a string.")
+    if b64 and len(b64) > BEAT_MAX_BYTES * 4 // 3 + 16:
+        raise ValueError("The beat file is too big.")
+    start = float(raw.get("start_sec") or 0.0)
+    end = raw.get("end_sec")
+    end = None if end in (None, "") else float(end)
+    if not np.isfinite(start) or start < 0:
+        raise ValueError("beat start_sec must be 0 or more.")
+    if end is not None and (not np.isfinite(end) or end <= start):
+        raise ValueError("beat end_sec must be after start_sec.")
+    if end is not None and end - start > BEAT_MAX_SECONDS + 0.5:
+        raise ValueError(f"Pick {int(BEAT_MAX_SECONDS)} seconds of beat or less.")
+    bpm = raw.get("bpm")
+    if bpm in (None, ""):
+        bpm = None
+    else:
+        bpm = float(bpm)
+        if not np.isfinite(bpm) or bpm < 30 or bpm > 300:
+            raise ValueError("Beat BPM should be between 30 and 300, or left blank.")
+    vocals = str(raw.get("vocals") or "auto").strip().lower()
+    if vocals not in ("auto", "keep", "remove"):
+        raise ValueError("beat vocals must be auto, keep, or remove.")
+    return {"b64": b64, "url": url, "start": start, "end": end, "bpm": bpm, "vocals": vocals}
+
+
+def load_beat(beat: dict[str, Any], sr: int) -> np.ndarray:
+    if beat["b64"]:
+        try:
+            data = base64.b64decode(beat["b64"], validate=False)
+        except Exception as exc:
+            raise ValueError("The beat audio is not valid base64.") from exc
+        if len(data) > BEAT_MAX_BYTES:
+            raise ValueError("The beat file is too big.")
+    else:
+        data = _fetch_beat_url(beat["url"])
+    pcm = _decode_beat_bytes(data, beat["start"], beat["end"], sr)
+    secs = len(pcm) / float(sr)
+    if secs < MIN_DURATION:
+        raise ValueError(f"Pick at least {int(MIN_DURATION)} seconds of beat.")
+    if secs > BEAT_MAX_SECONDS + 0.5:
+        pcm = pcm[: int(BEAT_MAX_SECONDS * sr)]
+    return pcm
+
+
+def fit_length(wav: np.ndarray, frames: int) -> np.ndarray:
+    wav = np.asarray(wav, dtype=np.float32)
+    if wav.ndim == 1:
+        wav = wav[:, None]
+    if wav.shape[1] == 1:
+        wav = np.concatenate([wav, wav], axis=1)
+    if len(wav) >= frames:
+        return wav[:frames]
+    pad = np.zeros((frames - len(wav), wav.shape[1]), dtype=np.float32)
+    return np.concatenate([wav, pad], axis=0)
+
+
+# A clip "has a vocal" when Demucs finds a vocal that is loud relative to the
+# clip and present for a fair share of it. Instrumentals usually leak < -30 dB.
+VOCAL_REL_DB = float(os.environ.get("BEAT_VOCAL_REL_DB", "-20"))
+VOCAL_ACTIVE_FRACTION = float(os.environ.get("BEAT_VOCAL_ACTIVE_FRACTION", "0.15"))
+
+
+def detect_and_strip_vocal(beat: np.ndarray, sr: int, mode: str) -> tuple[np.ndarray, dict[str, Any], np.ndarray | None]:
+    """Return (context_audio, report, instrumental_or_None). Never edits `beat`."""
+    report: dict[str, Any] = {"mode": mode, "detected": False, "removed": False}
+    if mode == "keep":
+        return beat, report, None
+    vocals, voc_sr, sep_s = separate_vocals(beat, sr)
+    if voc_sr != sr:
+        import torchaudio
+        t = torch.from_numpy(np.ascontiguousarray(vocals.T, dtype=np.float32))
+        vocals = torchaudio.functional.resample(t, voc_sr, sr).numpy().T.astype(np.float32)
+    vocals = fit_length(vocals, len(beat))
+    rel_db = rms_db(vocals) - rms_db(beat)
+    mono = np.mean(vocals, axis=1)
+    hop = int(sr * 0.05)
+    n = max(1, len(mono) // hop)
+    frames = mono[: n * hop].reshape(n, hop)
+    frame_db = 20 * np.log10(np.sqrt(np.mean(frames ** 2, axis=1)) + 1e-9)
+    beat_db = rms_db(beat)
+    active = float(np.mean(frame_db > beat_db - 12.0)) if n else 0.0
+    detected = rel_db > VOCAL_REL_DB and active > VOCAL_ACTIVE_FRACTION
+    report.update({"detected": bool(detected), "vocal_rel_db": round(float(rel_db), 2), "vocal_active_fraction": round(active, 3), "detect_seconds": round(sep_s, 2)})
+    log(f"vocal check: {report}")
+    if mode == "remove" or detected:
+        instrumental = (beat - vocals).astype(np.float32)
+        report["removed"] = True
+        return instrumental, report, instrumental
+    return beat, report, None
+
+
 def parse_input(event: dict) -> dict[str, Any]:
     inp = event.get("input") if isinstance(event, dict) else None
     if not isinstance(inp, dict):
@@ -414,7 +583,19 @@ def parse_input(event: dict) -> dict[str, Any]:
         seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
     else:
         seed = int(seed)
+    beat = parse_beat(inp.get("beat"))
+    if beat is not None and not IS_BASE:
+        raise ValueError(
+            "This endpoint runs ACE-Step turbo, which cannot write vocals over your beat. "
+            "Bring-your-own-beat needs the base-model endpoint."
+        )
+    if beat is not None and beat["bpm"] is not None:
+        bpm = beat["bpm"]
+    if beat is not None and lyrics == "[Instrumental]":
+        raise ValueError("Add some lyrics so there is something to sing.")
     return {
+        "beat": beat,
+        "return_raw": bool(inp.get("return_raw")),
         "tags": tags,
         "lyrics": lyrics,
         "duration": duration,
@@ -439,6 +620,9 @@ def handler(event: dict) -> dict[str, Any]:
     except Exception:
         pass
     cuda_free()
+
+    if job["beat"] is not None:
+        return handle_beat(pipe, job, t_all, device_name)
 
     mix, sr, infer_s, decode_path, mix_q = generate_mix(
         pipe,
@@ -496,7 +680,7 @@ def handler(event: dict) -> dict[str, Any]:
         "decode_path": decode_path,
         "dtype": "float32",
         "device": device_name,
-        "model": "Runware/acestep-v15-turbo-diffusers",
+        "model": MODEL_ID,
         "separator": DEMUCS_NAME,
         "dereverb": "UVR-De-Echo-Aggressive+UVR-DeEcho-DeReverb",
         "gate": gate_report,
@@ -505,8 +689,114 @@ def handler(event: dict) -> dict[str, Any]:
     }
 
 
+def handle_beat(pipe, job: dict[str, Any], t_all: float, device_name: str) -> dict[str, Any]:
+    """Lego: write a vocal stem from the beat as audio context. The beat is never altered."""
+    sr = int(getattr(pipe, "sample_rate", 48000))
+    t_dec = time.time()
+    beat = load_beat(job["beat"], sr)
+    frames = len(beat)
+    beat_secs = frames / float(sr)
+    log(f"beat: {beat_secs:.2f}s at {sr} Hz, decoded in {time.time()-t_dec:.1f}s rms_db={rms_db(beat):.1f}")
+    # If the clip already has a singer, swap it: Lego writes over the instrumental.
+    context, vocal_report, instrumental = detect_and_strip_vocal(beat, sr, job["beat"].get("vocals", "auto"))
+    src = torch.from_numpy(np.ascontiguousarray(context.T, dtype=np.float32))  # [2, T]
+
+    stem, stem_sr, infer_s, decode_path, stem_q = generate_mix(
+        pipe,
+        job["tags"],
+        job["lyrics"],
+        beat_secs,
+        job["bpm"],
+        job["seed"],
+        job["vocal_language"],
+        extra={
+            "task_type": "lego",
+            "track_name": "vocals",
+            "src_audio": src,
+            "repainting_start": 0.0,
+            "repainting_end": -1,
+        },
+    )
+    del src
+    cuda_free()
+    if stem_sr != sr:
+        raise RuntimeError(f"unexpected sample rate {stem_sr}")
+    stem = fit_length(stem, frames)
+
+    # Same dry chain as /create, even though Lego already returns a vocal stem.
+    vocals, voc_sr, sep_s = separate_vocals(stem, sr)
+    dry, dry_sr, uvr_s = dereverb_vocals(vocals, voc_sr)
+    if dry_sr != sr:
+        import torchaudio
+        t_dry = torch.from_numpy(np.ascontiguousarray(dry.T, dtype=np.float32))
+        dry = torchaudio.functional.resample(t_dry, dry_sr, sr).numpy().T.astype(np.float32)
+        dry_sr = sr
+    gated, gate_report = gate_vocal(dry, dry_sr)
+    gated = fit_length(gated, frames)
+    log(f"gate: {json.dumps({k: gate_report[k] for k in gate_report if k != 'regions_sec'})}")
+
+    # Preview only: the beat (instrumental when the old vocal was swapped) plus the dry vocal.
+    preview = context + gated
+
+    out: dict[str, Any] = {}
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        vocals_mp3 = td / "vocals.mp3"
+        preview_mp3 = td / "preview.mp3"
+        encode_mp3(gated, sr, vocals_mp3)
+        encode_mp3(preview, sr, preview_mp3)
+        out["vocals_mp3_base64"] = b64_file(vocals_mp3)
+        out["preview_mp3_base64"] = b64_file(preview_mp3)
+        out["vocals_bytes"] = vocals_mp3.stat().st_size
+        out["preview_bytes"] = preview_mp3.stat().st_size
+        if instrumental is not None:
+            inst_mp3 = td / "instrumental.mp3"
+            encode_mp3(instrumental, sr, inst_mp3)
+            out["instrumental_mp3_base64"] = b64_file(inst_mp3)
+        if job["return_raw"]:
+            raw_mp3 = td / "raw.mp3"
+            encode_mp3(stem, sr, raw_mp3)
+            out["raw_stem_mp3_base64"] = b64_file(raw_mp3)
+
+    total = time.time() - t_all
+    log(f"beat job done in {total:.1f}s infer={infer_s:.1f}s sep={sep_s:.1f}s uvr={uvr_s:.1f}s")
+    out.update({
+        "ok": True,
+        "task_type": "lego",
+        "track_name": "vocals",
+        "sample_rate": sr,
+        "beat_duration": round(beat_secs, 3),
+        "duration_actual": round(frames / float(sr), 3),
+        "aligned": True,
+        "beat_start_sec": job["beat"]["start"],
+        "seed": job["seed"],
+        "steps": STEPS,
+        "guidance_scale": GUIDANCE,
+        "shift": SHIFT,
+        "bpm": job["bpm"],
+        "tags": job["tags"],
+        "lyrics": job["lyrics"],
+        "infer_seconds": round(infer_s, 2),
+        "separate_seconds": round(sep_s, 2),
+        "uvr_seconds": round(uvr_s, 2),
+        "total_seconds": round(total, 2),
+        "decode_path": decode_path,
+        "dtype": "float32",
+        "device": device_name,
+        "model": MODEL_ID,
+        "separator": DEMUCS_NAME,
+        "dereverb": "UVR-De-Echo-Aggressive+UVR-DeEcho-DeReverb",
+        "gate": gate_report,
+        "stem_quality": stem_q,
+        "voiceSwapApplied": False,
+        "beat_vocal": vocal_report,
+        "primary": "vocals",
+    })
+    return out
+
+
 def preload() -> None:
-    log("=== ace-step 1.5 worker starting ===")
+    log(f"=== ace-step 1.5 worker starting ({VARIANT}, {MODEL_ID}, {STEPS} steps) ===")
     if torch.cuda.is_available():
         log(f"cuda {torch.version.cuda} device={torch.cuda.get_device_name(0)} "
             f"vram={torch.cuda.get_device_properties(0).total_memory/1024**3:.1f}G")
