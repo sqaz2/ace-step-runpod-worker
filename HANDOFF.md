@@ -3,6 +3,14 @@
 Written Fri 13 Nov 2026, 11:35 PM America/Edmonton, for whoever picks this up next (e.g. ChatGPT).
 Owner: Will Crowell (GitHub sqaz2). Nothing here is merged or live.
 
+## Listening decision (14 November 2026)
+
+Will's verdict: "c is better". Use C (`GD-07-Natural-New-Instrumental.mp3`)
+as the preferred v2 reference: natural lead tuning at strength 0.65 plus the
+BS-Roformer instrumental. The comparison holds the original double, harmony
+and ad-libs fixed. Use this reference for the next fresh-generation GPU test;
+full-image validation, end-to-end generation and release approval remain pending.
+
 ## Follow-up: CPU validation and recovered audio (14 November 2026)
 
 - Fixed best-of-takes selection: no measurable pitch now produces a null score
@@ -51,8 +59,9 @@ Owner: Will Crowell (GitHub sqaz2). Nothing here is merged or live.
   is not the production image. It does not establish GPU/container compatibility.
 - Added old/new instrumental solos and a third clip-07 mix using the new beat,
   with the instrumental RMS matched and a shared gain across all three mixes.
-- Remaining: build the base image, confirm one bounded GPU run and get Will's
-  listening verdict. Full-pipeline generation and GPU memory use remain unverified.
+- Listening verdict received: C is preferred. Remaining: build the base image
+  and compare a fresh bounded GPU run against C. Full-pipeline generation and
+  GPU memory use remain unverified.
 
 ## What Will wants
 - In the studio: add a track of type "Generative audio". A tip says to arm it and select part of the beat.
@@ -89,11 +98,11 @@ Owner: Will Crowell (GitHub sqaz2). Nothing here is merged or live.
 - 07 layers: the BEST so far, more in pitch and super natural. Not amazing singing, but okay.
 
 ## Next steps (the quality pass that was in progress)
-1. Use 07 as the preferred listening reference. Compare seeds/settings one at a time before changing defaults.
+1. Use version C of 07 as the preferred listening reference. Compare seeds/settings one at a time before changing defaults.
 2. A "Tune to key" toggle (default on, natural strength): key detection + partial pitch correction (tune.py).
 3. Cleaner swap instrumental: try htdemucs_ft with shifts, or BS-Roformer / MelBand-Roformer via
    audio-separator, plus mild filtering (instrumental.py). The instrumental is what Will hears, so it matters.
-4. Make v2 comparison clips (add mix, swap mix, swap instrumental, lead dry; tune on and off) and have Will listen.
+4. V2 comparisons are delivered and Will prefers C. Build the base image, then compare fresh GPU generation against C.
 5. Only after Will says go: merge #204 (Workers Builds deploys on merge to main) and merge the worker PR.
 
 ## Rules from Will
