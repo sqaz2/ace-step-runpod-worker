@@ -31,6 +31,8 @@ import torch
 from dereverb import dereverb_vocals, get_uvr
 from gate import gate_vocal, rms_db
 import layers as vlayers
+import tune as vtune
+import instrumental as vinst
 
 MODEL_DIR = Path(os.environ.get("PIPELINE_PATH", "/models/acestep-v15-turbo"))
 DEMUCS_NAME = os.environ.get("DEMUCS_MODEL", "htdemucs_ft")
@@ -51,6 +53,14 @@ BEAT_MAX_SECONDS = 120.0
 BEAT_MAX_BYTES = 24 * 1024 * 1024
 BEAT_URL_TIMEOUT = 30
 MP3_BITRATE = "192k"
+# Send the detected key to ACE-Step (keyscale) from this confidence up; the
+# user can always set the key. 0.75 was too strict (the test beats scored 0.69-0.77).
+KEY_SEND_CONFIDENCE = float(os.environ.get("BEAT_KEY_SEND_CONFIDENCE", "0.6"))
+# Below this the key guess is ignored and tuning snaps to the nearest semitone only.
+KEY_TUNE_CONFIDENCE = float(os.environ.get("BEAT_KEY_TUNE_CONFIDENCE", "0.5"))
+TUNE_STRENGTH = float(os.environ.get("BEAT_TUNE_STRENGTH", "0.65"))
+# Best-of-N lead takes (different seeds), scored on how in tune they are.
+DEFAULT_TAKES = int(os.environ.get("BEAT_TAKES", "2"))
 
 PIPE = None
 DEMUCS = None
@@ -545,8 +555,18 @@ def detect_and_strip_vocal(beat: np.ndarray, sr: int, mode: str) -> tuple[np.nda
     report.update({"detected": bool(detected), "vocal_rel_db": round(float(rel_db), 2), "vocal_active_fraction": round(active, 3), "detect_seconds": round(sep_s, 2)})
     log(f"vocal check: {report}")
     if mode == "remove" or detected:
-        instrumental = (beat - vocals).astype(np.float32)
         report["removed"] = True
+        report["separator"] = f"{DEMUCS_NAME} (beat - vocals)"
+        instrumental = (beat - vocals).astype(np.float32)
+        if vinst.available():
+            try:
+                instrumental, vocals, inst_s, model = vinst.separate(beat, sr)
+                report["separator"] = model
+                report["separate_seconds"] = round(inst_s, 2)
+            except Exception as exc:  # never fail a swap over the nicer separator
+                log(f"roformer instrumental failed, using demucs subtraction: {exc}")
+                traceback.print_exc()
+                cuda_free()
         return instrumental, report, instrumental, vocals
     return beat, report, None, None
 
@@ -602,12 +622,32 @@ def parse_input(event: dict) -> dict[str, Any]:
     if timesig not in ("2", "3", "4", "6"):
         timesig = "4"
     keyscale = inp.get("keyscale")
-    keyscale = keyscale.strip()[:16] if isinstance(keyscale, str) and keyscale.strip() else None
+    keyscale = keyscale.strip()[:16] if isinstance(keyscale, str) and keyscale.strip() and keyscale.strip().lower() != "auto" else None
+    user_key = None
+    if keyscale:
+        user_key = vtune.parse_keyscale(keyscale)
+        if user_key is None:
+            raise ValueError("Key should look like 'F major' or 'A minor'.")
+        keyscale = user_key["name"]
+    tune_on = inp.get("tune")
+    tune_on = True if tune_on is None else bool(tune_on)
+    strength = inp.get("tune_strength")
+    strength = TUNE_STRENGTH if strength in (None, "") else float(strength)
+    if not np.isfinite(strength) or strength < 0 or strength > 1:
+        raise ValueError("tune_strength should be between 0 and 1.")
+    takes = inp.get("takes")
+    takes = DEFAULT_TAKES if takes in (None, "") else int(takes)
+    takes = max(1, min(3, takes))
     return {
         "layers": sorted(set(raw_layers)) if beat is not None else [],
         "harmony_interval": harmony_interval,
         "timesignature": timesig,
         "keyscale": keyscale,
+        "user_key": user_key,
+        "tune": tune_on,
+        "tune_strength": strength,
+        "takes": takes,
+        "return_untuned": bool(inp.get("return_untuned")),
         "beat": beat,
         "return_raw": bool(inp.get("return_raw")),
         "tags": tags,
@@ -713,9 +753,11 @@ def handle_beat(pipe, job: dict[str, Any], t_all: float, device_name: str) -> di
     log(f"beat: {beat_secs:.2f}s at {sr} Hz, decoded in {time.time()-t_dec:.1f}s rms_db={rms_db(beat):.1f}")
     # If the clip already has a singer, swap it: Lego writes over the instrumental.
     context, vocal_report, instrumental, old_vocal = detect_and_strip_vocal(beat, sr, job["beat"].get("vocals", "auto"))
-    key = vlayers.estimate_key(context, sr)
-    keyscale = job["keyscale"] or (key["name"] if key["confidence"] >= 0.75 else None)
-    log(f"key estimate {key} -> keyscale={keyscale}")
+    est_key = vlayers.estimate_key(context, sr)
+    key = job["user_key"] or est_key
+    keyscale = job["keyscale"] or (est_key["name"] if est_key["confidence"] >= KEY_SEND_CONFIDENCE else None)
+    tune_key = key if (job["user_key"] or est_key["confidence"] >= KEY_TUNE_CONFIDENCE) else None
+    log(f"key estimate {est_key} -> keyscale={keyscale} tune_key={tune_key and tune_key['name']}")
     src = torch.from_numpy(np.ascontiguousarray(context.T, dtype=np.float32))  # [2, T]
 
     def lego(track: str, tags: str, lyrics: str, seed: int):
@@ -735,10 +777,23 @@ def handle_beat(pipe, job: dict[str, Any], t_all: float, device_name: str) -> di
         g, rep = gate_vocal(d, sr)
         return fit_length(g, frames), rep, sep, uvr
 
-    stem, stem_sr, infer_s, decode_path, stem_q = lego("vocals", job["tags"], job["lyrics"], job["seed"])
-    cuda_free()
-    if stem_sr != sr:
-        raise RuntimeError(f"unexpected sample rate {stem_sr}")
+    # Best of N takes: same settings, consecutive seeds, keep the most in-tune one.
+    takes_report = []
+    best = None
+    infer_s = 0.0
+    for i in range(job["takes"]):
+        seed_i = job["seed"] + i
+        t_stem, t_sr, t_inf, t_dec, t_q = lego("vocals", job["tags"], job["lyrics"], seed_i)
+        cuda_free()
+        if t_sr != sr:
+            raise RuntimeError(f"unexpected sample rate {t_sr}")
+        infer_s += t_inf
+        score = vtune.pitch_score(t_stem, sr, tune_key)
+        takes_report.append({"seed": seed_i, **score})
+        log(f"take {i+1}/{job['takes']} seed={seed_i} pitch={score}")
+        if best is None or score["score"] < best[0]:
+            best = (score["score"], seed_i, t_stem, t_dec, t_q)
+    _, chosen_seed, stem, decode_path, stem_q = best
     stem = fit_length(stem, frames)
     # Same dry chain as /create, even though Lego already returns a vocal stem.
     gated, gate_report, sep_s, uvr_s = dry(stem)
@@ -750,6 +805,15 @@ def handle_beat(pipe, job: dict[str, Any], t_all: float, device_name: str) -> di
         target_db = vlayers.active_rms_db(context, sr) - 2.0
     gated, lead_gain = vlayers.level_match(gated, sr, target_db)
     gated = vlayers.edge_fades(gated, sr)
+    untuned = gated
+    tune_report: dict[str, Any] = {"enabled": job["tune"]}
+    if job["tune"]:
+        t_tune = time.time()
+        gated, rep_t = vtune.tune_to_key(gated, sr, tune_key, job["tune_strength"])
+        gated = vlayers.edge_fades(gated, sr)
+        tune_report.update(rep_t)
+        tune_report["seconds"] = round(time.time() - t_tune, 2)
+        log(f"tune: {tune_report}")
 
     layer_audio: dict[str, np.ndarray] = {}
     layer_report: dict[str, Any] = {}
@@ -768,6 +832,8 @@ def handle_beat(pipe, job: dict[str, Any], t_all: float, device_name: str) -> di
         a_gated, a_rep, _, _ = dry(fit_length(a_stem, frames))
         a_gated = a_gated * vlayers.gaps_mask(gated, sr)[:, None]
         a_gated, a_gain = vlayers.level_match(a_gated, sr, target_db - 5.0)
+        if job["tune"]:
+            a_gated, _ = vtune.tune_to_key(a_gated, sr, tune_key, job["tune_strength"])
         layer_audio["adlibs"] = vlayers.edge_fades(a_gated, sr)
         layer_report["adlibs"] = {"method": "second Lego take (backing_vocals) gated to the gaps in the lead",
                                   "infer_seconds": round(a_infer, 2), "open_fraction_before_gaps": a_rep.get("open_fraction"),
@@ -796,6 +862,10 @@ def handle_beat(pipe, job: dict[str, Any], t_all: float, device_name: str) -> di
             inst_mp3 = td / "instrumental.mp3"
             encode_mp3(instrumental, sr, inst_mp3)
             out["instrumental_mp3_base64"] = b64_file(inst_mp3)
+        if job["return_untuned"] and job["tune"]:
+            un_mp3 = td / "untuned.mp3"
+            encode_mp3(untuned, sr, un_mp3)
+            out["vocals_untuned_mp3_base64"] = b64_file(un_mp3)
         if job["return_raw"]:
             raw_mp3 = td / "raw.mp3"
             encode_mp3(stem, sr, raw_mp3)
@@ -812,7 +882,10 @@ def handle_beat(pipe, job: dict[str, Any], t_all: float, device_name: str) -> di
         "duration_actual": round(frames / float(sr), 3),
         "aligned": True,
         "beat_start_sec": job["beat"]["start"],
-        "seed": job["seed"],
+        "seed": chosen_seed,
+        "seed_requested": job["seed"],
+        "takes": takes_report,
+        "tune": tune_report,
         "steps": STEPS,
         "guidance_scale": GUIDANCE,
         "shift": SHIFT,
@@ -834,6 +907,7 @@ def handle_beat(pipe, job: dict[str, Any], t_all: float, device_name: str) -> di
         "voiceSwapApplied": False,
         "beat_vocal": vocal_report,
         "key": key,
+        "key_estimate": est_key,
         "keyscale_sent": keyscale,
         "timesignature": job["timesignature"],
         "lead_gain_db": lead_gain,

@@ -68,7 +68,7 @@ COPY models/uvr /models/uvr
 ENV HF_HUB_OFFLINE=1
 
 WORKDIR /app
-COPY handler.py gate.py dereverb.py layers.py check_imports.py /app/
+COPY handler.py gate.py dereverb.py layers.py tune.py instrumental.py check_imports.py /app/
 
 # Cheap import check (no GPU in the build machine).
 RUN python /app/check_imports.py

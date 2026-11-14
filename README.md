@@ -107,3 +107,25 @@ length as the clip.
   - `beat_vocal`, the detection report
   - `task_type: "lego"` and `aligned: true`
   - `raw_stem_mp3_base64` when `return_raw: true`
+
+### Quality options (base-v4)
+
+- **Best of N takes.** `takes` (1–3, default 2) runs Lego with consecutive seeds
+  (`seed`, `seed+1`, …). Every take uses the same settings: 50 steps, CFG 7,
+  shift 3, timesignature 4. The worker keeps the take whose sung notes sit
+  closest to the key, and reports every take's score in `takes`.
+- **Key.**
+  - `keyscale` (e.g. `"F major"`) sets the key.
+  - With no `keyscale`, the worker estimates the key. It sends the estimate to
+    ACE-Step from confidence 0.6 (was 0.75) and tunes to it from 0.5.
+  - Below 0.5, tuning only snaps notes to the nearest semitone.
+- **Tune to key.** `tune` (default `true`) and `tune_strength` (0–1, default
+  0.65) control gentle per-note pitch correction (Praat PSOLA, `tune.py`).
+  - Each note's centre moves toward the nearest key note by `strength`.
+  - Vibrato, slides and consonants are kept, and unpitched (rap) parts are left untouched.
+  - The lanes are made from the tuned lead, and ad-libs are tuned too.
+  - `return_untuned: true` also returns `vocals_untuned_mp3_base64` for A/B.
+- **Swap instrumental.** When an old vocal is removed, the instrumental comes
+  from a Roformer model run through audio-separator (`instrumental.py`,
+  `BEAT_SEPARATOR_MODEL`). If that model fails, it falls back to Demucs
+  subtraction. Demucs is still used to *detect* the vocal and for the dry chain.

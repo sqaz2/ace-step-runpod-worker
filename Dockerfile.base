@@ -35,10 +35,17 @@ COPY --from=v3 /models/uvr /models/uvr
 COPY bake_acestep_base.py /tmp/bake_acestep_base.py
 RUN python /tmp/bake_acestep_base.py && rm -rf /models/acestep-v15-base/.cache
 
+# Gentle "tune to key" (Praat PSOLA) and the Roformer instrumental for vocal swap.
+RUN pip install --no-cache-dir --no-deps praat-parselmouth==0.4.7 rotary-embedding-torch==0.6.5
+ARG BEAT_SEPARATOR_MODEL=model_bs_roformer_ep_317_sdr_12.9755.ckpt
+ENV BEAT_SEPARATOR_MODEL=${BEAT_SEPARATOR_MODEL}
+RUN python -c "import os; from audio_separator.separator import Separator; s=Separator(model_file_dir='/models/uvr'); s.download_model_files(os.environ['BEAT_SEPARATOR_MODEL'])" \
+    && ls -la /models/uvr
+
 ENV HF_HUB_OFFLINE=1
 
 WORKDIR /app
-COPY handler.py gate.py dereverb.py layers.py check_imports.py /app/
+COPY handler.py gate.py dereverb.py layers.py tune.py instrumental.py check_imports.py /app/
 RUN python /app/check_imports.py \
     && python -c "from demucs.pretrained import get_model; m=get_model('htdemucs_ft'); print('htdemucs_ft ok', m.samplerate)"
 

@@ -28,7 +28,7 @@ COPY models/uvr/ /models/uvr/
 COPY models/torch/hub/checkpoints/ /models/torch/hub/checkpoints/
 
 WORKDIR /app
-COPY handler.py gate.py dereverb.py layers.py check_imports.py bake_demucs.py /app/
+COPY handler.py gate.py dereverb.py layers.py tune.py instrumental.py check_imports.py bake_demucs.py /app/
 
 # Confirm ft loads from the baked files with no network, and UVR files are present.
 # HF_HUB_OFFLINE stays 1; torch.hub still reads local checkpoints.
