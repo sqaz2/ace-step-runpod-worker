@@ -5,6 +5,7 @@
 FROM ghcr.io/sqaz2/ace-step-runpod-worker:v2
 
 ENV DEMUCS_MODEL=htdemucs_ft \
+    ORT_DISABLE_TELEMETRY=1 \
     UVR_MODEL_DIR=/models/uvr
 
 # Pin torch so pip cannot replace the CUDA 12.6 wheel.
@@ -28,7 +29,7 @@ COPY models/uvr/ /models/uvr/
 COPY models/torch/hub/checkpoints/ /models/torch/hub/checkpoints/
 
 WORKDIR /app
-COPY handler.py gate.py dereverb.py check_imports.py bake_demucs.py /app/
+COPY handler.py gate.py dereverb.py layers.py tune.py instrumental.py check_imports.py bake_demucs.py /app/
 
 # Confirm ft loads from the baked files with no network, and UVR files are present.
 # HF_HUB_OFFLINE stays 1; torch.hub still reads local checkpoints.

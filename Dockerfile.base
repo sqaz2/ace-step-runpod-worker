@@ -1,0 +1,53 @@
+# Bring-your-own-beat worker: ACE-Step 1.5 2B *base* (Lego vocals over a beat)
+# + the same dry chain as /create (htdemucs_ft -> UVR x2 -> gate).
+#
+# Reuses the proven Python env, Demucs and UVR weights from the v3 turbo
+# image, but not its turbo weights, so the image only carries one DiT.
+# Separate endpoint from /create. Public image, no secrets.
+FROM ghcr.io/sqaz2/ace-step-runpod-worker:v3 AS v3
+
+FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    ORT_DISABLE_TELEMETRY=1 \
+    HF_HOME=/models/hf \
+    HUGGINGFACE_HUB_CACHE=/models/hf \
+    TRANSFORMERS_CACHE=/models/hf \
+    TORCH_HOME=/models/torch \
+    PIPELINE_PATH=/models/acestep-v15-base \
+    ACESTEP_VARIANT=base \
+    DEMUCS_MODEL=htdemucs_ft \
+    UVR_MODEL_DIR=/models/uvr \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-venv ffmpeg libsndfile1 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=v3 /opt/venv /opt/venv
+RUN ln -sf /opt/venv/bin/python /usr/local/bin/python \
+    && ln -sf /opt/venv/bin/python /usr/local/bin/python3
+COPY --from=v3 /models/torch /models/torch
+COPY --from=v3 /models/uvr /models/uvr
+
+COPY bake_acestep_base.py /tmp/bake_acestep_base.py
+RUN python /tmp/bake_acestep_base.py && rm -rf /models/acestep-v15-base/.cache
+
+# Gentle "tune to key" (Praat PSOLA) and the Roformer instrumental for vocal swap.
+RUN pip install --no-cache-dir --no-deps praat-parselmouth==0.4.7 rotary-embedding-torch==0.6.5
+ARG BEAT_SEPARATOR_MODEL=model_bs_roformer_ep_317_sdr_12.9755.ckpt
+ENV BEAT_SEPARATOR_MODEL=${BEAT_SEPARATOR_MODEL}
+RUN python -c "import os; from audio_separator.separator import Separator; s=Separator(model_file_dir='/models/uvr'); s.download_model_files(os.environ['BEAT_SEPARATOR_MODEL'])" \
+    && ls -la /models/uvr
+
+ENV HF_HUB_OFFLINE=1
+
+WORKDIR /app
+COPY handler.py gate.py dereverb.py layers.py tune.py instrumental.py check_imports.py /app/
+RUN python /app/check_imports.py \
+    && python -c "from demucs.pretrained import get_model; m=get_model('htdemucs_ft'); print('htdemucs_ft ok', m.samplerate)"
+
+CMD ["python", "-u", "/app/handler.py"]

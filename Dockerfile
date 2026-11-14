@@ -13,6 +13,7 @@ FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
+    ORT_DISABLE_TELEMETRY=1 \
     HF_HOME=/models/hf \
     HUGGINGFACE_HUB_CACHE=/models/hf \
     TRANSFORMERS_CACHE=/models/hf \
@@ -68,7 +69,7 @@ COPY models/uvr /models/uvr
 ENV HF_HUB_OFFLINE=1
 
 WORKDIR /app
-COPY handler.py gate.py dereverb.py check_imports.py /app/
+COPY handler.py gate.py dereverb.py layers.py tune.py instrumental.py check_imports.py /app/
 
 # Cheap import check (no GPU in the build machine).
 RUN python /app/check_imports.py
