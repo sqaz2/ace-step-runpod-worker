@@ -791,8 +791,9 @@ def handle_beat(pipe, job: dict[str, Any], t_all: float, device_name: str) -> di
         score = vtune.pitch_score(t_stem, sr, tune_key)
         takes_report.append({"seed": seed_i, **score})
         log(f"take {i+1}/{job['takes']} seed={seed_i} pitch={score}")
-        if best is None or score["score"] < best[0]:
-            best = (score["score"], seed_i, t_stem, t_dec, t_q)
+        rank = vtune.take_rank(score)
+        if best is None or rank < best[0]:
+            best = (rank, seed_i, t_stem, t_dec, t_q)
     _, chosen_seed, stem, decode_path, stem_q = best
     stem = fit_length(stem, frames)
     # Same dry chain as /create, even though Lego already returns a vocal stem.

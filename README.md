@@ -113,7 +113,9 @@ length as the clip.
 - **Best of N takes.** `takes` (1–3, default 2) runs Lego with consecutive seeds
   (`seed`, `seed+1`, …). Every take uses the same settings: 50 steps, CFG 7,
   shift 3, timesignature 4. The worker keeps the take whose sung notes sit
-  closest to the key, and reports every take's score in `takes`.
+  closest to the key, and reports every take's score in `takes`. A take with
+  no measurable notes has `score: null`; it cannot outrank measured singing.
+  If all takes are unpitched, the first take is kept.
 - **Key.**
   - `keyscale` (e.g. `"F major"`) sets the key.
   - With no `keyscale`, the worker estimates the key. It sends the estimate to
@@ -129,3 +131,18 @@ length as the clip.
   from a Roformer model run through audio-separator (`instrumental.py`,
   `BEAT_SEPARATOR_MODEL`). If that model fails, it falls back to Demucs
   subtraction. Demucs is still used to *detect* the vocal and for the dry chain.
+
+### CPU quality checks
+
+Run the inexpensive DSP and orchestration regression checks without model
+weights or a GPU:
+
+```sh
+python -m pip install numpy scipy soundfile praat-parselmouth==0.4.7
+python -m unittest discover -s tests -v
+```
+
+The pitch checks use real Praat resynthesis and measure the resulting audio.
+GPU calls, generation, and model separation are mocked in the orchestration
+checks. These tests do not establish singing quality or substitute for a
+container build and the original-beat listening comparison.

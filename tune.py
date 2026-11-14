@@ -76,7 +76,7 @@ def target_for(center: float, key: dict | None, max_snap_cents: float) -> float:
 
 
 def pitch_score(audio: np.ndarray, sr: int, key: dict | None) -> dict:
-    """How in tune a take is: median note distance (cents) to the key, and the share of clearly wrong notes."""
+    """Pitch error for measurable notes; an unpitched take has no score."""
     import parselmouth
 
     snd = parselmouth.Sound(_mono(audio), sampling_frequency=sr)
@@ -89,10 +89,23 @@ def pitch_score(audio: np.ndarray, sr: int, key: dict | None) -> dict:
         c = float(np.median(midi[a:b]))
         devs.append(abs(c - target_for(c, key, 100.0)) * 100)
     if not devs:
-        return {"notes": 0, "median_cents": None, "off_share": None, "score": 50.0}
+        return {"notes": 0, "median_cents": None, "off_share": None, "score": None}
     devs = np.array(devs)
     med, off = float(np.median(devs)), float(np.mean(devs > 40))
     return {"notes": int(len(devs)), "median_cents": round(med, 1), "off_share": round(off, 3), "score": round(med + 60 * off, 2)}
+
+
+def take_rank(report: dict) -> tuple[int, float]:
+    """Prefer measured pitch over missing pitch, preserving seed order on ties.
+
+    No-note clips (including spoken takes) cannot be judged as in tune. If
+    all takes are unpitched, their equal rank keeps the first performance.
+    Keep the missing score as JSON null rather than reporting a fake number.
+    """
+    score = report.get("score")
+    if report.get("notes", 0) > 0 and isinstance(score, (int, float)) and np.isfinite(score):
+        return 0, float(score)
+    return 1, 0.0
 
 
 def tune_to_key(audio: np.ndarray, sr: int, key: dict | None, strength: float = 0.6,
