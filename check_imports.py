@@ -1,5 +1,6 @@
 """Cheap import check used at image-build time (no GPU on the build machine)."""
 import os
+os.environ.setdefault("ORT_DISABLE_TELEMETRY", "1")
 import sys
 from pathlib import Path
 

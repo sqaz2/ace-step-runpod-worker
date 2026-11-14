@@ -13,6 +13,7 @@ FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
+    ORT_DISABLE_TELEMETRY=1 \
     HF_HOME=/models/hf \
     HUGGINGFACE_HUB_CACHE=/models/hf \
     TRANSFORMERS_CACHE=/models/hf \

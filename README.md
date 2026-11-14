@@ -146,3 +146,13 @@ The pitch checks use real Praat resynthesis and measure the resulting audio.
 GPU calls, generation, and model separation are mocked in the orchestration
 checks. These tests do not establish singing quality or substitute for a
 container build and the original-beat listening comparison.
+
+The original private test archive has now been recovered and its existing
+leads reprocessed into level-matched tune-on/off listening samples. The real
+Roformer also completed separation of the original 40-second swap clip on
+CPU with full-length, finite stereo output. See `HANDOFF.md` for measurements
+and limits; no new singing was generated in that local comparison. Listening
+approval and a full base-image/GPU check are still required before release.
+
+The image environments and entry points set `ORT_DISABLE_TELEMETRY=1`
+before ONNX Runtime initialization, including separator model preparation.

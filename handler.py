@@ -24,6 +24,10 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+# Opt out before audio-separator can initialize ONNX Runtime. The API-only
+# toggle is too late to prevent its initialization telemetry on newer builds.
+os.environ.setdefault("ORT_DISABLE_TELEMETRY", "1")
+
 import numpy as np
 import soundfile as sf
 import torch

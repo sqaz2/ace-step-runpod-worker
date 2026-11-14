@@ -5,6 +5,7 @@
 FROM ghcr.io/sqaz2/ace-step-runpod-worker:v2
 
 ENV DEMUCS_MODEL=htdemucs_ft \
+    ORT_DISABLE_TELEMETRY=1 \
     UVR_MODEL_DIR=/models/uvr
 
 # Pin torch so pip cannot replace the CUDA 12.6 wheel.

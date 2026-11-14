@@ -3,7 +3,7 @@
 Written Fri 13 Nov 2026, 11:35 PM America/Edmonton, for whoever picks this up next (e.g. ChatGPT).
 Owner: Will Crowell (GitHub sqaz2). Nothing here is merged or live.
 
-## Follow-up: CPU validation checkpoint
+## Follow-up: CPU validation and recovered audio (14 November 2026)
 
 - Fixed best-of-takes selection: no measurable pitch now produces a null score
   instead of 50, so an unpitched take cannot beat an off-key sung take. If all
@@ -21,13 +21,38 @@ Owner: Will Crowell (GitHub sqaz2). Nothing here is merged or live.
   claim that generated singing sounds good. Model inference is mocked in tests.
 - No image was built or deployed, no RunPod jobs were submitted, and neither PR
   was merged. The full site checks have not been rerun; the site code is unchanged.
-- The old `/workspace/vocal-ai/prompt-song/byob-test/` directory is not available
-  in this workspace. Original beats, clips 02/05/07, prompts, seeds, and job
-  settings are still needed for fair v2 listening comparisons. Do not assume
-  seed 11 or extra harmony lanes alone explain why clip 07 sounded better.
-- Remaining: recover those samples/settings, build the base image, confirm
-  model loading and one bounded GPU run, then create the tune-on/off samples
-  below. Quality and GPU memory use remain unverified until those steps pass.
+- Recovered the original beats, clips 02/05/07, prompts and job settings from
+  the private [BYOB test-audio release](https://github.com/sqaz2/Generative-download/releases/tag/byob-test-audio-2026-11-13).
+  `byob-test.zip` SHA-256:
+  `4c1a05ae74e8fac8a38dcd3e0d308a1c1f0cbc63b079ab5a0a5bd5e52645bf42`.
+  Keep the audio and lyrics out of this public worker repository.
+- Reprocessed the existing dry leads with natural tuning (strength 0.65),
+  using the handoff's estimated F major key. Independent pitch analysis of
+  the rendered WAVs measured median error 29.7 -> 10.0 cents (02), 4.6 -> 2.3
+  (05), and 11.4 -> 4.9 (07). These are pitch measurements, not listening scores;
+  even the original score prefers 05 while Will preferred 07.
+- Exported paired dry-lead and lead-plus-beat comparisons for all three takes.
+  Lead RMS is matched with a constant gain; each off/on pair shares the same
+  peak-safe export gain. Timing is unchanged. The clip-07 all-layers comparison
+  changes only the lead: the existing double, harmony and ad-libs stay fixed.
+  These are reprocessed performances, not newly generated vocals.
+- Clips 05 and 07 decode to identical instrumentals. Clip 07 used seed 11,
+  extra lanes, explicit 4/4 and a lead level adjustment of -5.69 dB. Its F-major
+  confidence was 0.686, but `keyscale_sent` was null under the old threshold.
+  These differences are confounded; do not declare seed 11 a universal fix.
+- Disabled ONNX Runtime telemetry before initialization in the container
+  environments, handler and import check. This also covers separator imports
+  during model downloads at build time.
+- The actual BS-Roformer-Viperx-1297 model completed separation of the original
+  40-second swap clip on CPU in 631.5 seconds. Both stems are finite stereo,
+  1,920,000 frames at 48 kHz. This exercised the real worker separation function,
+  not a test double. CPU torch 2.11.0 and audio-separator 0.48.0 were used.
+  The local environment did not install every optional separator backend and
+  is not the production image. It does not establish GPU/container compatibility.
+- Added old/new instrumental solos and a third clip-07 mix using the new beat,
+  with the instrumental RMS matched and a shared gain across all three mixes.
+- Remaining: build the base image, confirm one bounded GPU run and get Will's
+  listening verdict. Full-pipeline generation and GPU memory use remain unverified.
 
 ## What Will wants
 - In the studio: add a track of type "Generative audio". A tip says to arm it and select part of the beat.
@@ -64,7 +89,7 @@ Owner: Will Crowell (GitHub sqaz2). Nothing here is merged or live.
 - 07 layers: the BEST so far, more in pitch and super natural. Not amazing singing, but okay.
 
 ## Next steps (the quality pass that was in progress)
-1. Find why 07 sounded more in tune than 02/05 (seed 11, swap clip, settings) and make that the default.
+1. Use 07 as the preferred listening reference. Compare seeds/settings one at a time before changing defaults.
 2. A "Tune to key" toggle (default on, natural strength): key detection + partial pitch correction (tune.py).
 3. Cleaner swap instrumental: try htdemucs_ft with shifts, or BS-Roformer / MelBand-Roformer via
    audio-separator, plus mild filtering (instrumental.py). The instrumental is what Will hears, so it matters.
